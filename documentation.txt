@@ -1,0 +1,145 @@
+
+******* Packet Loss Probaility V/S Avg No. of Transmissions *******
+-----------------------------------------------------------------------------------
+| P      | No. of Transmissions | No. of Packets       |  Avg No. of Transmissions |
+|--------|----------------------|----------------------|---------------------------|
+| 0.05   | 471                  | 401                  | 1.1646                    |
+| 0.10   | 536                  | 401                  | 1.3366                    |
+| 0.15   | 610                  | 401                  | 1.5212                    |
+| 0.20   | 642                  | 401                  | 1.6001                    |
+| 0.25   | 761                  | 401                  | 1.8977                    |
+| 0.30   | 820                  | 401                  | 2.0445                    |
+| 0.35   | 861                  | 401                  | 2.1471                    |
+| 0.40   | 1012                 | 401                  | 2.5237                    |
+| 0.45   | 1094                 | 401                  | 2.7282                    |
+| 0.50   | 1231                 | 401                  | 3.0698                    |
+------------------------------------------------------------------------------------
+
+
+******* DATA STRUCTURES *******
+
+1. NET_SOCKET
+    a) int sock_id: stores the udp socket id
+    b) char ip_addr[INET_ADDRSTRLEN]: stores the ip address
+    c) unit16_t port: stores port number
+    d) int err_code: global error variable
+
+2. window
+    a) int size: sze of window
+    b) int start: start sequence number of window
+    c) int wnd[256]: For swnd,
+                        i: ith message in send buffer which is sent but not yet acknowledged
+                        -1: otherwise
+                     For rwnd,
+                        i: expecting ith message in receiver buffer 
+                        -1: otherwise
+
+3. SHARED_MEM
+    a) int free: Denotes whether the KTP socket is free or not
+    b) pid_t pid: process id of creator of the socket
+    c) int udp_sockid: corresponsing internal udp socket id
+    d) char ip_addr[INET_ADDRSTRLEN]: IP Address of the destination
+    e) uint16_t port: Port number of the destination
+    f) char send_buffer[10][512]: send buffer of the KTP socket
+    g) int send_buffer_size: current size of send buffer
+    h) int sendbufferlen[10]: array to store length of each message in send buffer
+    i) time_t last_send_time[256]:  time at which message correspoding to ith seq number was last.(Initialised with -1)
+    j) char recv_buffer[10][512]: receive buffer of MTP socket
+    k) int recv_buffer_live[10]: it is 1 if the ith message in receive buffer is not read by the application, 0 otherwise
+    l) int rcvbufferlen[10]: array to store length of each message in receive buffer
+    m) int recv_buffer_base: pointer to the location in receive buffer for application to read next
+    n) window swnd: send window for KTP socket
+    o) window rwnd: receive windoe for KTP socket
+    p) int full: indicates whether receive buffer is full or not
+
+******* Library Functions *******
+    a)  int k_socket(int domain,int type,int protocol)
+            -> checks for an empty slot in the shared memory for a new KTP socket
+            -> if found, insert the details of the KTP socket(along with default initialization) form net_socket obtained in create_and_bind() function in initksocket
+            -> returns the index of the shared memory on success else return -1
+
+    b)  int k_bind(char src_ip[],uint16_t src_port,char dest_ip[],uint16_t dest_port)
+            -> binds the KTP socket with the scr_ip and src_port
+            -> net_socket stores these 2 information then initksocket is signalled using semaphore to call the bind() function inside create_and_bind()
+            -> the dest_ip and dest_port is stored in the respective fields of the shared memory 
+
+    c)  ssize_t k_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen)
+            -> matches the dest_port and dest_ip with the corresponding fields of shared memory and also checks the sender_buffer_size
+            -> if it matches and sender buffer is not full,then the message is stored in the next empty location
+            -> the index of the buffer is also stored in swnd in the next seq number which is not yet sent(i.e, -1)
+            -> returns length of message sent on success, -1 on error
+    d)  ssize_t k_recvfrom(int sockfd, void* buf, size_t len, int flags, struct sockaddr * src_addr, socklen_t *addrlen)
+            -> checks whether any message is already received in the receive buffer using the base pointer and the recv_buffer_live array
+            -> If found, store that message in the buf and update the corresponding fields(including increasing rwnd size)
+            -> Otherwise, set the global error variable to ENOMESSAGE indicating no message is received in the receive buffer
+            -> Return length of message in receive buffer on success, return -1 on error
+
+    e)  int k_close(int sockfd)
+            -> Marks the corresponding shared memory as free
+            -> return value is 0
+
+    f)  int drop_Message()
+            -> generate a random probability to simulate packet loss
+            -> It is used in initksocket to emulate packet loss
+
+
+
+******* initksocket Functions *******
+    a)  main() 
+            -> creates and initializes the shared memory and semaphores
+            -> calls the create_and_bind() function
+    b)  create_and_bind()
+            -> it runs an infinite while loop which ensures that irrespective of number of KTP sockets there are always N udp sockets
+            -> it is also responsible for bnding the sockfd with the port using the net_socket structure
+    c)  void* R() [Receiver Thread]
+            ->  runs an infinite loop and waits on select call on all the current sockets with timeout T
+            ->  if select call times out:
+                    -> call FD_SET for each socket in use
+                    -> if full is set to 1 but receive window size is not 0,set full to 0
+                    -> send an acknowledgment for the last acknowledged sequence(in case the acknowledgment was lost)
+            ->  else:
+                    -> if data is received:
+                            ->  if message is received  in order, update the seq accordingly by changing the rwnd.start value
+                            ->  if message is received out of order and if the message is new store it in the receive buffer
+                            ->  send acknowledgement in both the cases depending on the value of last acknowledged sequence 
+                            ->  update the receive window and check whether it is full or not
+                    -> if ack is received:
+                            ->update the start of swnd as per the sequence number received
+                            -> also update the swnd size using the receive windoe size obtained from the header
+    d)  void* S() [Sender Thread]
+            -> Sleep for T/2 seconds
+            -> On wake up,check for each KTP socket in use, whether timeout has occured for any packet which is sent and not yet acknowledged
+            -> If Timeout is detected:
+                    -> Resend all the messages in send window
+            -> Otherwise:
+                    -> Check the sen buffer for any new message,if found send it
+    e)  handler()
+            ->Does all the cleanup when Ctrl+C is pressed
+
+    ++Acknowledgement Packet++
+    +-------------------------------------------------------+
+    |   Index   |               Description                 |
+    +-------------------------------------------------------+
+    |     0     |   Type(0=ACK 1=DATA)                      |
+    +-------------------------------------------------------+
+    |    1-8    |   Sequence Number of last receive packet  |
+    +-------------------------------------------------------+
+    |    9-12   |   Receive Window size                     |
+    +-------------------------------------------------------+
+    Packet Size = 13B
+
+    ++ Data Packet++
+    +-------------------------------------------------------+
+    |   Index   |               Description                 |
+    +-------------------------------------------------------+
+    |     0     |   Type(0=ACK 1=DATA)                      |
+    +-------------------------------------------------------+
+    |    1-8    |   Sequence Number of packet being sent    |
+    +-------------------------------------------------------+
+    |    9-18   |   Length of message being sent            |
+    +-------------------------------------------------------+
+    |   19-530  |   Reserved for the message                |
+    +-------------------------------------------------------+
+    Packet Size=531B
+
+
